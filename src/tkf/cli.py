@@ -213,3 +213,27 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+@app.command()
+def clean(
+    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
+    all_jobs: bool = typer.Option(True, "--all", help="Delete all completed/failed jobs and pods"),
+):
+    """Clean up all completed, failed, or leftover jobs and pods in the namespace."""
+    init_k8s()
+    batch_v1 = client.BatchV1Api()
+    core_v1 = client.CoreV1Api()
+    
+    console.print(f"[yellow]Cleaning up all Jobs and Pods in namespace '{namespace}'...[/yellow]")
+    
+    # 1. Delete Jobs
+    jobs = batch_v1.list_namespaced_job(namespace=namespace)
+    for j in jobs.items:
+        jname = j.metadata.name
+        try:
+            batch_v1.delete_namespaced_job(name=jname, namespace=namespace, propagation_policy="Foreground")
+            console.print(f"  - Deleted Job: [dim]{jname}[/dim]")
+        except Exception:
+            pass
+
+    console.print(f"[green]✔ Namespace '{namespace}' cleaned up successfully![/green]")

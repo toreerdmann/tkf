@@ -38,11 +38,13 @@ class VolumeConfig:
     local_path: str = "local_pipeline_volume"
     temp: bool = False
     storage_class: str = "local-path"
+    create_if_missing: bool = True
+    enabled: bool = True
 
     def to_spec(self, fallback_name: str) -> VolumeSpec:
         vol_name = self.name or (f"{fallback_name}-pvc" if not self.temp else f"temp-{uuid.uuid4().hex[:8]}")
         return VolumeSpec(
-            enabled=True,
+            enabled=self.enabled,
             name=vol_name,
             size=self.size,
             mountPath=self.mount_path,
@@ -68,6 +70,8 @@ class Task:
     command: list[Any] = field(default_factory=list)
     args: list[Any] = field(default_factory=list)
     docker_image: str = "python:3.12-slim"
+    packages: list[str] = field(default_factory=list)  # e.g. ["pandas", "scikit-learn"] (uses uv run --with)
+    image_pull_secrets: list[str] = field(default_factory=list)  # e.g. ["ecr-image-pull-secret"]
     env: dict[str, Any] = field(default_factory=dict)
     resources: ComputeResources = field(default_factory=ComputeResources)
 
@@ -143,7 +147,6 @@ class Pipeline:
         """Add a task node to the graph and auto-wire any referenced parent tasks."""
         if id(task) not in self._nodes:
             self._nodes[id(task)] = task
-            # Auto-infer dependencies from task.output() / task.dataset() references
             referenced_parents = task.find_referenced_parent_tasks()
             for parent_name in referenced_parents:
                 parent_task = next((t for t in self._nodes.values() if t.name == parent_name), None)
@@ -278,7 +281,8 @@ class Pipeline:
             tid = id(task)
             p_names = [self._nodes[pid].name for pid in parents_map.get(tid, [])]
             dep_str = f" <- [{', '.join(p_names)}]" if p_names else " (root)"
-            print(f"  * {task.name}{dep_str}")
+            pkgs = f" (pkgs: {', '.join(task.packages)})" if task.packages else ""
+            print(f"  * {task.name}{dep_str}{pkgs}")
         print()
 
     def to_manifest(self) -> dict[str, Any]:
@@ -303,6 +307,8 @@ class Pipeline:
                 "command": cmd_strs,
                 "args": args_strs,
                 "dependsOn": p_names,
+                "packages": task.packages,
+                "imagePullSecrets": task.image_pull_secrets,
                 "env": env_strs,
                 "cpu": task.resources.cpu,
                 "memory": task.resources.memory,
@@ -328,11 +334,44 @@ class Pipeline:
         """Return manifest formatted as YAML."""
         return yaml.dump(self.to_manifest(), sort_keys=False)
 
-    def run(self, local: bool = False, namespace: str | None = None, wait: bool = True) -> Any:
-        """Run the pipeline either locally with simulated storage, or submit to cluster."""
+    def run(
+        self,
+        local: bool = False,
+        direct: bool = True,
+        namespace: str | None = None,
+        wait: bool = True,
+    ) -> Any:
+        """Execute the pipeline.
+
+        - local=True: Runs locally on host with simulated /workspace.
+        - direct=True (Default): Runs directly on Kubernetes Jobs without CRD/Operator.
+        - direct=False: Submits a PipelineRun CustomResource to Kubernetes operator.
+        """
+        target_ns = namespace or self.namespace
         if local:
             return self._run_local()
-        return self.submit(namespace=namespace, wait=wait)
+        if direct:
+            from tkf.runner import DirectRunner
+            runner = DirectRunner(pipeline=self, namespace=target_ns)
+            return runner.run(stream_logs=True)
+        return self.submit(namespace=target_ns, wait=wait)
+
+    def submit_job(
+        self,
+        namespace: str | None = None,
+        service_account: str | None = None,
+    ) -> str:
+        """Submit the pipeline as a fire-and-forget in-cluster Launcher Job.
+
+        You can safely close your terminal or disconnect from Codespaces.
+        """
+        from tkf.launcher import submit_launcher_job
+        target_ns = namespace or self.namespace
+        return submit_launcher_job(
+            pipeline=self,
+            namespace=target_ns,
+            service_account=service_account,
+        )
 
     def _run_local(self) -> bool:
         """Execute tasks locally sequentially in topological order with parameter substitution."""
@@ -347,14 +386,12 @@ class Pipeline:
         for i, task in enumerate(tasks, start=1):
             print(f"\n[{i}/{len(tasks)}] Running task '{task.name}'...")
 
-            # Substitute {{ tasks.<parent>.outputs.<name> }} and {{ tasks.<parent>.artifacts.<name> }}
             def substitute(val: Any) -> str:
                 s = str(val)
                 def repl(match):
                     p_name, kind, o_name = match.group(1), match.group(2), match.group(3)
                     if kind == "artifacts":
                         return str(vol_path / "artifacts" / p_name / o_name)
-                    # Outputs:
                     if o_name in task_outputs[p_name]:
                         return task_outputs[p_name][o_name]
                     param_file = vol_path / ".tkf" / "outputs" / p_name / o_name
@@ -372,12 +409,17 @@ class Pipeline:
             for k, v in task.env.items():
                 env[k] = substitute(v)
 
+            # If task has packages, prefix with uv run --with ...
+            if task.packages:
+                with_args = [f"--with={pkg}" for pkg in task.packages]
+                if cmd and cmd[0] in ("python", "python3"):
+                    cmd = ["uv", "run"] + with_args + cmd
+
             full_cmd = cmd + args
             try:
                 subprocess.run(full_cmd, check=True, env=env)
                 print(f"-> Task '{task.name}' Succeeded.")
 
-                # Collect outputs from disk
                 task_out_dir = vol_path / ".tkf" / "outputs" / task.name
                 if task_out_dir.exists():
                     for f in task_out_dir.iterdir():
@@ -402,7 +444,6 @@ class Pipeline:
         manifest = self.to_manifest()
         manifest["metadata"]["namespace"] = target_ns
 
-        # Add unique run name if needed
         run_name = f"{self.name}-{uuid.uuid4().hex[:6]}"
         manifest["metadata"]["name"] = run_name
 

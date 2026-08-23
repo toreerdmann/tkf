@@ -15,6 +15,8 @@ from tkf.io import (
     dataset_path,
     model_path,
 )
+from tkf.runner import DirectRunner
+from tkf.launcher import submit_launcher_job
 from tkf.models import Phase, PipelineRunSpec, TaskSpec, VolumeSpec
 from tkf.cli import main
 
@@ -23,6 +25,8 @@ __all__ = [
     "Task",
     "VolumeConfig",
     "ComputeResources",
+    "DirectRunner",
+    "submit_launcher_job",
     "Phase",
     "PipelineRunSpec",
     "TaskSpec",

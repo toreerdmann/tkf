@@ -159,6 +159,7 @@ def launch_task_job(
         ),
         spec=client.V1JobSpec(
             backoff_limit=0,
+            ttl_seconds_after_finished=300,
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
                     labels={
