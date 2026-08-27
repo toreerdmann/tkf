@@ -131,6 +131,21 @@ def make_parallel_config(branches: collections.abc.Iterable[list]) -> list[list]
     return result
 
 
+def get_current_user() -> str:
+    """Detect current user from TKF_USER, GITHUB_USER, GITHUB_ACTOR, USER, or LOGNAME."""
+    raw_user = (
+        os.environ.get("TKF_USER")
+        or os.environ.get("GITHUB_USER")
+        or os.environ.get("GITHUB_ACTOR")
+        or os.environ.get("USER")
+        or os.environ.get("LOGNAME")
+        or "default"
+    )
+    # Sanitize to valid k8s label value (alphanumeric, -, _, ., max 63 chars)
+    sanitized = re.sub(r"[^a-zA-Z0-9_.-]", "-", str(raw_user).strip()).strip("-.")[:63].lower()
+    return sanitized or "default"
+
+
 class Pipeline:
     """A directed acyclic graph (DAG) of tasks to execute on tkf or locally."""
 
@@ -139,6 +154,7 @@ class Pipeline:
         name: str = "default-run",
         volume: VolumeConfig | None = None,
         namespace: str = "default",
+        user: str | None = None,
         labels: dict[str, str] | None = None,
         annotations: dict[str, str] | None = None,
         ttl_seconds_after_finished: int | None = 300,
@@ -146,7 +162,9 @@ class Pipeline:
         self.name = to_k8s_name(name)
         self.volume = volume or VolumeConfig()
         self.namespace = namespace
-        self.labels = labels or {}
+        self.user = user or get_current_user()
+        self.labels = labels.copy() if labels else {}
+        self.labels.setdefault("tkf/user", self.user)
         self.annotations = annotations or {}
         self.ttl_seconds_after_finished = ttl_seconds_after_finished
 

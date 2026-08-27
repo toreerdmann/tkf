@@ -77,7 +77,13 @@ def test_task_and_pipeline_labels_annotations():
     assert t1.labels == {"team": "ml", "env": "prod"}
     assert t1.annotations == {"custom.annotation/foo": "bar"}
     assert t1.disable_istio is True
-    assert p.labels == {"pipeline-label": "test"}
+    assert p.labels["pipeline-label"] == "test"
+    assert "tkf/user" in p.labels
     assert p.annotations == {"pipeline-anno": "val"}
     assert p.ttl_seconds_after_finished == 600
+
+    # Custom user override
+    p_custom = Pipeline("custom-user-pipe", user="custom-bot")
+    assert p_custom.user == "custom-bot"
+    assert p_custom.labels["tkf/user"] == "custom-bot"
 

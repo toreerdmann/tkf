@@ -83,6 +83,7 @@ def list_runs(
 
     table = Table(title=f"PipelineRuns ({ns})")
     table.add_column("Name", style="bold cyan")
+    table.add_column("Owner", style="magenta")
     table.add_column("Phase", style="bold")
     table.add_column("Tasks (Done/Total)")
     table.add_column("PVC")
@@ -90,6 +91,8 @@ def list_runs(
 
     for item in items:
         name = item["metadata"]["name"]
+        labels = item["metadata"].get("labels", {})
+        owner = labels.get("tkf/user", "-")
         status = item.get("status", {})
         phase = status.get("phase", "Pending")
         pvc = status.get("pvcName", "-")
@@ -107,7 +110,7 @@ def list_runs(
             "Pending": "yellow",
         }.get(phase, "white")
 
-        table.add_row(name, f"[{phase_color}]{phase}[/{phase_color}]", task_str, pvc, str(start_time))
+        table.add_row(name, owner, f"[{phase_color}]{phase}[/{phase_color}]", task_str, pvc, str(start_time))
 
     console.print(table)
 
@@ -323,6 +326,8 @@ if __name__ == "__main__":
 @app.command()
 def clean(
     run_id: Optional[str] = typer.Option(None, "--run", "-r", help="Clean only resources for a specific run ID", autocompletion=complete_tasks),
+    user: Optional[str] = typer.Option(None, "--user", "-u", help="Target specific user (defaults to current user)"),
+    all_users: bool = typer.Option(False, "--all-users", help="Clean resources across all users in namespace"),
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
     all_jobs: bool = typer.Option(True, "--all", help="Delete all completed/failed tkf jobs and pods"),
     pvcs: bool = typer.Option(False, "--pvcs", help="Also delete temporary tkf PVCs labeled with tkf/run"),
@@ -333,21 +338,35 @@ def clean(
     batch_v1 = client.BatchV1Api()
     core_v1 = client.CoreV1Api()
     
-    label_selector = f"tkf/run={run_id}" if run_id else "tkf/run"
-    console.print(f"[yellow]Cleaning up tkf resources in namespace '{ns}' (selector: {label_selector})...[/yellow]")
+    from tkf.pipeline import get_current_user
+    target_user = user or (None if (all_users or run_id) else get_current_user())
+    
+    if run_id:
+        label_selector = f"tkf/run={run_id}"
+    elif target_user:
+        label_selector = f"tkf/user={target_user}"
+    else:
+        label_selector = "tkf/run"
+
+    user_info = f" for user '{target_user}'" if target_user else " across all users"
+    console.print(f"[yellow]Cleaning up tkf resources in namespace '{ns}'{user_info} (selector: {label_selector})...[/yellow]")
     
     # 1. Delete tkf Jobs (and their pods)
     jobs = batch_v1.list_namespaced_job(namespace=ns, label_selector=label_selector)
-    # Also include launcher jobs if no specific run filter or matching launcher
+    # Also include launcher jobs
     if not run_id:
-        launcher_jobs = batch_v1.list_namespaced_job(namespace=ns, label_selector="tkf/launcher")
-        jobs.items.extend(launcher_jobs.items)
+        launcher_sel = f"tkf/launcher,tkf/user={target_user}" if target_user else "tkf/launcher"
+        launcher_jobs = batch_v1.list_namespaced_job(namespace=ns, label_selector=launcher_sel)
+        seen_names = {j.metadata.name for j in jobs.items}
+        for lj in launcher_jobs.items:
+            if lj.metadata.name not in seen_names:
+                jobs.items.append(lj)
 
     deleted_jobs = 0
     for j in jobs.items:
         jname = j.metadata.name
         try:
-            batch_v1.delete_namespaced_job(name=jname, namespace=namespace, propagation_policy="Foreground")
+            batch_v1.delete_namespaced_job(name=jname, namespace=ns, propagation_policy="Foreground")
             console.print(f"  - Deleted Job: [dim]{jname}[/dim]")
             deleted_jobs += 1
         except Exception:
@@ -358,12 +377,12 @@ def clean(
 
     # 2. Optionally Delete only tkf temporary PVCs
     if pvcs:
-        pvc_list = core_v1.list_namespaced_persistent_volume_claim(namespace=namespace, label_selector=label_selector)
+        pvc_list = core_v1.list_namespaced_persistent_volume_claim(namespace=ns, label_selector=label_selector)
         deleted_pvcs = 0
         for p in pvc_list.items:
             pname = p.metadata.name
             try:
-                core_v1.delete_namespaced_persistent_volume_claim(name=pname, namespace=namespace)
+                core_v1.delete_namespaced_persistent_volume_claim(name=pname, namespace=ns)
                 console.print(f"  - Deleted tkf PVC: [red]{pname}[/red]")
                 deleted_pvcs += 1
             except Exception:
@@ -371,5 +390,5 @@ def clean(
         if deleted_pvcs == 0:
             console.print("  [dim]No tkf PVCs found to clean.[/dim]")
 
-    console.print(f"[green]✔ tkf cleanup in namespace '{namespace}' complete![/green]")
+    console.print(f"[green]✔ tkf cleanup in namespace '{ns}' complete![/green]")
 

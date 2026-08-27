@@ -110,10 +110,11 @@ vol_spec = spec_data.get('spec', {{}}).get('volume', {{}})
 tasks_spec = spec_data.get('spec', {{}}).get('tasks', [])
 namespace = '{namespace}'
 run_id = '{run_id}'
+user = '{pipeline.user}'
 mount_path = vol_spec.get('mountPath', '/workspace')
 pvc_name = '{pvc_name}' if '{pvc_name}' != 'None' else None
 
-print(f"=== Starting In-Cluster Pipeline: {{run_id}} ===")
+print(f"=== Starting In-Cluster Pipeline: {{run_id}} (User: {{user}}) ===")
 print(f"Namespace: {{namespace}} | PVC: {{pvc_name}}")
 
 task_statuses = {{t['name']: 'Pending' for t in tasks_spec}}
@@ -176,14 +177,15 @@ async def run_task(task):
         volume_mounts=volume_mounts, resources=resources, image_pull_policy="IfNotPresent",
         termination_message_path="/dev/termination-log", termination_message_policy="File",
     )
+    task_labels = {{"tkf/run": run_id, "tkf/task": tname, "tkf/user": user}}
     job = client.V1Job(
-        metadata=client.V1ObjectMeta(name=job_name, namespace=namespace, labels={{"tkf/run": run_id, "tkf/task": tname}}),
+        metadata=client.V1ObjectMeta(name=job_name, namespace=namespace, labels=task_labels),
         spec=client.V1JobSpec(
             backoff_limit=0,
             ttl_seconds_after_finished=300,
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
-                    labels={{"tkf/run": run_id, "tkf/task": tname}},
+                    labels=task_labels,
                     annotations={{"sidecar.istio.io/inject": "false"}},
                 ),
                 spec=client.V1PodSpec(restart_policy="Never", containers=[container], volumes=volumes, image_pull_secrets=secrets)
@@ -261,18 +263,24 @@ asyncio.run(main())
         image_pull_policy="IfNotPresent",
     )
 
+    launcher_labels = {
+        "tkf/launcher": run_id,
+        "tkf/run": run_id,
+        "tkf/user": pipeline.user,
+        **pipeline.labels,
+    }
     job = client.V1Job(
         metadata=client.V1ObjectMeta(
             name=launcher_job_name,
             namespace=namespace,
-            labels={"tkf/launcher": run_id},
+            labels=launcher_labels,
         ),
         spec=client.V1JobSpec(
             backoff_limit=0,
             ttl_seconds_after_finished=300,
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
-                    labels={"tkf/launcher": run_id},
+                    labels=launcher_labels,
                     annotations={"sidecar.istio.io/inject": "false"},
                 ),
                 spec=client.V1PodSpec(
