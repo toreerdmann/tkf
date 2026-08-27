@@ -64,7 +64,7 @@ def substitute(val):
     def repl(m):
         p_name, kind, o_name = m.group(1), m.group(2), m.group(3)
         if kind == 'artifacts':
-            return f"{{mount_path}}/artifacts/{{p_name}}/{{o_name}}"
+            return f"{{mount_path}}/runs/{{run_id}}/artifacts/{{p_name}}/{{o_name}}"
         return str(task_outputs.get(p_name, {{}}).get(o_name, m.group(0)))
     return REF_REGEX.sub(repl, s)
 

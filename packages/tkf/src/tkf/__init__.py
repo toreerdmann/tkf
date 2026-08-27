@@ -2,6 +2,7 @@
 
 from tkf.pipeline import (
     Pipeline,
+    PipelineStepper,
     Task,
     VolumeConfig,
     ComputeResources,
@@ -15,18 +16,34 @@ from tkf.io import (
     dataset_path,
     model_path,
 )
-from tkf.runner import DirectRunner
+from tkf.decorators import (
+    task,
+    Dataset,
+    Model,
+    Artifact,
+    TaskCallable,
+    is_local,
+)
+from tkf.runner import DirectRunner, RemoteTaskHandle
 from tkf.launcher import submit_launcher_job
 from tkf.models import Phase, PipelineRunSpec, TaskSpec, VolumeSpec
 from tkf.cli import main
 
 __all__ = [
     "Pipeline",
+    "PipelineStepper",
     "Task",
     "VolumeConfig",
     "ComputeResources",
     "DirectRunner",
+    "RemoteTaskHandle",
     "submit_launcher_job",
+    "task",
+    "Dataset",
+    "Model",
+    "Artifact",
+    "TaskCallable",
+    "is_local",
     "Phase",
     "PipelineRunSpec",
     "TaskSpec",

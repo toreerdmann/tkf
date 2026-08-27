@@ -166,8 +166,8 @@ class DirectRunner:
         all_succeeded = all(status == "Succeeded" for status in self.task_statuses.values())
         return all_succeeded
 
-    async def _run_task_job(self, task: Task, pvc_name: str | None, stream_logs: bool) -> bool:
-        """Submit a single Kubernetes Job, stream its logs, and capture output parameters."""
+    def create_task_job(self, task: Task, pvc_name: str | None = None) -> str:
+        """Submit a single Kubernetes Job to the cluster and return its job_name."""
         job_name = f"{self.run_id}-{task.name}"
         self.task_jobs[task.name] = job_name
         mount_path = self.pipeline.volume.mount_path
@@ -178,9 +178,15 @@ class DirectRunner:
             def repl(match):
                 p_name, kind, o_name = match.group(1), match.group(2), match.group(3)
                 if kind == "artifacts":
-                    return f"{mount_path}/artifacts/{p_name}/{o_name}"
+                    return f"{mount_path}/runs/{self.run_id}/artifacts/{p_name}/{o_name}"
                 return str(self.task_outputs.get(p_name, {}).get(o_name, match.group(0)))
-            return REF_REGEX.sub(repl, s)
+            res = REF_REGEX.sub(repl, s)
+            # Automatic translation from local workspace directory to remote PVC mount path
+            local_vol_name = self.pipeline.volume.local_path
+            if res.startswith(f"{local_vol_name}/") or res.startswith(f"./{local_vol_name}/"):
+                rel = res.removeprefix("./").removeprefix(f"{local_vol_name}/")
+                return f"{mount_path}/{rel}"
+            return res
 
         # Build command and arguments
         # If task specifies `packages` and default image, wrap with `uv run --with pkg1,pkg2`
@@ -211,11 +217,12 @@ class DirectRunner:
         # Volumes and mounts
         volumes = []
         volume_mounts = []
-        if pvc_name:
+        actual_pvc = pvc_name or self._ensure_volume()
+        if actual_pvc:
             volumes.append(
                 client.V1Volume(
                     name="tkf-workspace",
-                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name=pvc_name),
+                    persistent_volume_claim=client.V1PersistentVolumeClaimVolumeSource(claim_name=actual_pvc),
                 )
             )
             volume_mounts.append(
@@ -275,59 +282,140 @@ class DirectRunner:
 
         console.print(f"[bold blue]▶ Dispatching Task Job:[/bold blue] [cyan]{task.name}[/cyan] ([dim]{job_name}[/dim])")
         self.batch_v1.create_namespaced_job(namespace=self.namespace, body=job)
+        return job_name
 
-        # Wait for pod to start and stream logs
+    async def _run_task_job(self, task: Task, pvc_name: str | None, stream_logs: bool) -> bool:
+        """Submit a single Kubernetes Job and wait for its completion."""
+        job_name = self.create_task_job(task, pvc_name)
         return await self._wait_and_stream_task(task.name, job_name, stream_logs)
 
     async def _wait_and_stream_task(self, task_name: str, job_name: str, stream_logs: bool) -> bool:
-        """Poll job and stream logs from the active pod."""
+        """Poll job and stream logs from the active pod with full diagnostic reporting on failure."""
         pod_name = None
         
         # 1. Find pod name
-        while not pod_name:
-            await asyncio.sleep(1.0)
+        for _ in range(30):
             pods = self.core_v1.list_namespaced_pod(
                 namespace=self.namespace,
                 label_selector=f"batch.kubernetes.io/job-name={job_name}",
             )
             if pods.items:
                 pod_name = pods.items[0].metadata.name
-
-        # 2. Wait until container starts running or completes
-        while True:
-            pod = self.core_v1.read_namespaced_pod_status(name=pod_name, namespace=self.namespace)
-            phase = pod.status.phase
-            if phase in ("Running", "Succeeded", "Failed"):
                 break
             await asyncio.sleep(1.0)
 
-        # 3. Stream or print logs
+        if not pod_name:
+            console.print(f"[bold red]✖ Could not find pod for Job '{job_name}'[/bold red]")
+            return False
+
+        # 2. Wait until container starts or terminates
+        while True:
+            try:
+                pod = self.core_v1.read_namespaced_pod_status(name=pod_name, namespace=self.namespace)
+                phase = pod.status.phase
+                if phase in ("Running", "Succeeded", "Failed"):
+                    break
+                
+                # Check for container waiting errors (e.g. ImagePullBackOff, ErrImagePull)
+                if pod.status.container_statuses:
+                    for cs in pod.status.container_statuses:
+                        if cs.state.waiting and cs.state.waiting.reason in ("ImagePullBackOff", "ErrImagePull", "CrashLoopBackOff"):
+                            console.print(f"[bold red]✖ Container error in pod {pod_name}: {cs.state.waiting.reason} ({cs.state.waiting.message})[/bold red]")
+                            return False
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+        # 3. Wait for final Job completion
+        while True:
+            job = self.batch_v1.read_namespaced_job_status(name=job_name, namespace=self.namespace)
+            if (job.status.succeeded and job.status.succeeded > 0) or (job.status.failed and job.status.failed > 0):
+                break
+            await asyncio.sleep(1.0)
+
+        # 4. Fetch logs after execution
+        logs = ""
         try:
-            logs = self.core_v1.read_namespaced_pod_log(name=pod_name, namespace=self.namespace, container=task_name)
-            if logs and stream_logs:
-                console.print(f"[dim]── Logs for {task_name} ──────────────────────────────────────[/dim]")
-                console.print(logs.strip())
-                console.print(f"[dim]─────────────────────────────────────────────────────────────[/dim]")
+            raw_logs = self.core_v1.read_namespaced_pod_log(name=pod_name, namespace=self.namespace, container=task_name)
+            logs = raw_logs.decode("utf-8") if isinstance(raw_logs, bytes) else str(raw_logs)
         except Exception:
             pass
 
-        # 4. Check final Job completion
-        while True:
-            job = self.batch_v1.read_namespaced_job_status(name=job_name, namespace=self.namespace)
+        if logs.strip() and stream_logs:
+            console.print(f"[dim]── Logs for {task_name} ──────────────────────────────────────[/dim]")
+            console.print(logs.strip())
+            console.print(f"[dim]─────────────────────────────────────────────────────────────[/dim]")
+
+        # 5. Check outcome
+        if job.status.succeeded and job.status.succeeded > 0:
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            if pod.status.container_statuses:
+                term = pod.status.container_statuses[0].state.terminated
+                if term and term.message:
+                    try:
+                        self.task_outputs[task_name] = json.loads(term.message)
+                    except Exception:
+                        self.task_outputs[task_name] = {"output": term.message.strip()}
+            
+            console.print(f"[bold green]✔ Task '{task_name}' Succeeded.[/bold green]")
+            return True
+        else:
+            pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
+            exit_code = None
+            reason = "Failed"
+            if pod.status.container_statuses and pod.status.container_statuses[0].state.terminated:
+                term = pod.status.container_statuses[0].state.terminated
+                exit_code = term.exit_code
+                reason = term.reason or "Failed"
+            console.print(f"[bold red]✖ Task '{task_name}' FAILED (Reason: {reason}, ExitCode: {exit_code}).[/bold red]")
+            return False
+
+
+class RemoteTaskHandle:
+    """Handle to a running or completed remote Kubernetes task job."""
+
+    def __init__(self, runner: DirectRunner, task: Task, job_name: str):
+        self.runner = runner
+        self.task = task
+        self.job_name = job_name
+
+    def status(self) -> str:
+        """Query Kubernetes Job status ('Pending', 'Running', 'Succeeded', 'Failed')."""
+        try:
+            job = self.runner.batch_v1.read_namespaced_job_status(name=self.job_name, namespace=self.runner.namespace)
             if job.status.succeeded and job.status.succeeded > 0:
-                # Capture outputs from termination log
-                pod = self.core_v1.read_namespaced_pod(name=pod_name, namespace=self.namespace)
-                if pod.status.container_statuses:
-                    term = pod.status.container_statuses[0].state.terminated
-                    if term and term.message:
-                        try:
-                            self.task_outputs[task_name] = json.loads(term.message)
-                        except Exception:
-                            self.task_outputs[task_name] = {"output": term.message.strip()}
-                
-                console.print(f"[bold green]✔ Task '{task_name}' Succeeded.[/bold green]")
-                return True
-            elif job.status.failed and job.status.failed > 0:
-                console.print(f"[bold red]✖ Task '{task_name}' FAILED.[/bold red]")
-                return False
-            await asyncio.sleep(1.0)
+                return "Succeeded"
+            if job.status.failed and job.status.failed > 0:
+                return "Failed"
+            if job.status.active and job.status.active > 0:
+                return "Running"
+        except Exception:
+            pass
+        return "Pending"
+
+    def logs(self) -> str:
+        """Fetch remote logs for this task container."""
+        pods = self.runner.core_v1.list_namespaced_pod(
+            namespace=self.runner.namespace,
+            label_selector=f"batch.kubernetes.io/job-name={self.job_name}",
+        )
+        if pods.items:
+            pod_name = pods.items[0].metadata.name
+            try:
+                return self.runner.core_v1.read_namespaced_pod_log(
+                    name=pod_name,
+                    namespace=self.runner.namespace,
+                    container=self.task.name,
+                )
+            except Exception:
+                return ""
+        return ""
+
+    def wait(self, stream_logs: bool = True) -> bool:
+        """Synchronously wait for the remote task Job to complete and stream logs."""
+        loop = asyncio.new_event_loop()
+        try:
+            success = loop.run_until_complete(self.runner._wait_and_stream_task(self.task.name, self.job_name, stream_logs))
+            return success
+        finally:
+            loop.close()

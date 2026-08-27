@@ -55,8 +55,12 @@ def set_output(name: str, value: Any) -> None:
 
     # 2. Also persist to shared volume directory
     vol = os.environ.get("VOLUME", "/workspace")
+    run_name = os.environ.get("TKF_RUN_NAME")
     task_name = os.environ.get("TKF_TASK_NAME", "default")
-    out_dir = Path(vol) / ".tkf" / "outputs" / task_name
+    if run_name:
+        out_dir = Path(vol) / "runs" / run_name / "outputs" / task_name
+    else:
+        out_dir = Path(vol) / ".tkf" / "outputs" / task_name
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         (out_dir / name).write_text(val_str)
@@ -67,8 +71,12 @@ def set_output(name: str, value: Any) -> None:
 def artifact_path(name: str, create_parents: bool = True) -> Path:
     """Get the absolute path for an output artifact in the shared volume."""
     vol = os.environ.get("VOLUME", "/workspace")
+    run_name = os.environ.get("TKF_RUN_NAME")
     task_name = os.environ.get("TKF_TASK_NAME", "default")
-    path = Path(vol) / "artifacts" / task_name / name
+    if run_name:
+        path = Path(vol) / "runs" / run_name / "artifacts" / task_name / name
+    else:
+        path = Path(vol) / "artifacts" / task_name / name
     if create_parents:
         path.parent.mkdir(parents=True, exist_ok=True)
     return path

@@ -218,13 +218,14 @@ if __name__ == "__main__":
 def clean(
     namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
     all_jobs: bool = typer.Option(True, "--all", help="Delete all completed/failed jobs and pods"),
+    pvcs: bool = typer.Option(False, "--pvcs", help="Also delete PVCs in the namespace"),
 ):
-    """Clean up all completed, failed, or leftover jobs and pods in the namespace."""
+    """Clean up all completed, failed, or leftover jobs, pods, and PVCs in the namespace."""
     init_k8s()
     batch_v1 = client.BatchV1Api()
     core_v1 = client.CoreV1Api()
     
-    console.print(f"[yellow]Cleaning up all Jobs and Pods in namespace '{namespace}'...[/yellow]")
+    console.print(f"[yellow]Cleaning up Jobs and Pods in namespace '{namespace}'...[/yellow]")
     
     # 1. Delete Jobs
     jobs = batch_v1.list_namespaced_job(namespace=namespace)
@@ -235,5 +236,16 @@ def clean(
             console.print(f"  - Deleted Job: [dim]{jname}[/dim]")
         except Exception:
             pass
+
+    # 2. Optionally Delete PVCs
+    if pvcs:
+        pvc_list = core_v1.list_namespaced_persistent_volume_claim(namespace=namespace)
+        for p in pvc_list.items:
+            pname = p.metadata.name
+            try:
+                core_v1.delete_namespaced_persistent_volume_claim(name=pname, namespace=namespace)
+                console.print(f"  - Deleted PVC: [red]{pname}[/red]")
+            except Exception:
+                pass
 
     console.print(f"[green]✔ Namespace '{namespace}' cleaned up successfully![/green]")
