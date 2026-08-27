@@ -74,6 +74,9 @@ class Task:
     image_pull_secrets: list[str] = field(default_factory=list)  # e.g. ["ecr-image-pull-secret"]
     env: dict[str, Any] = field(default_factory=dict)
     resources: ComputeResources = field(default_factory=ComputeResources)
+    labels: dict[str, str] = field(default_factory=dict)
+    annotations: dict[str, str] = field(default_factory=dict)
+    disable_istio: bool = True
 
     def __post_init__(self):
         object.__setattr__(self, "name", to_k8s_name(self.name))
@@ -134,10 +137,16 @@ class Pipeline:
         name: str = "default-run",
         volume: VolumeConfig | None = None,
         namespace: str = "default",
+        labels: dict[str, str] | None = None,
+        annotations: dict[str, str] | None = None,
+        ttl_seconds_after_finished: int | None = 300,
     ):
         self.name = to_k8s_name(name)
         self.volume = volume or VolumeConfig()
         self.namespace = namespace
+        self.labels = labels or {}
+        self.annotations = annotations or {}
+        self.ttl_seconds_after_finished = ttl_seconds_after_finished
 
         # DAG representation: node_id -> Task, parent_id -> list[child_ids]
         self._nodes: dict[int, Task] = {}

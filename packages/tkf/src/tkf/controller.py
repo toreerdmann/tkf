@@ -57,7 +57,7 @@ def ensure_pvc(spec: dict[str, Any], meta: dict[str, Any], logger: kopf.Logger) 
         metadata=client.V1ObjectMeta(
             name=pvc_name,
             namespace=namespace,
-            labels={"tkf.dev/pipeline": run_name},
+            labels={"tkf/pipeline": run_name},
         ),
         spec=client.V1PersistentVolumeClaimSpec(
             access_modes=["ReadWriteOnce"],
@@ -153,8 +153,8 @@ def launch_task_job(
             name=job_name,
             namespace=namespace,
             labels={
-                "tkf.dev/pipeline": run_name,
-                "tkf.dev/task": task_name,
+                "tkf/pipeline": run_name,
+                "tkf/task": task_name,
             },
         ),
         spec=client.V1JobSpec(
@@ -163,9 +163,10 @@ def launch_task_job(
             template=client.V1PodTemplateSpec(
                 metadata=client.V1ObjectMeta(
                     labels={
-                        "tkf.dev/pipeline": run_name,
-                        "tkf.dev/task": task_name,
-                    }
+                        "tkf/pipeline": run_name,
+                        "tkf/task": task_name,
+                    },
+                    annotations={"sidecar.istio.io/inject": "false"},
                 ),
                 spec=client.V1PodSpec(
                     restart_policy="Never",

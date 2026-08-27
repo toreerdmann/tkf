@@ -38,6 +38,7 @@ class DirectRunner:
         self.task_statuses: dict[str, str] = {}  # task_name -> "Pending" | "Running" | "Succeeded" | "Failed" | "Skipped"
         self.task_outputs: dict[str, dict[str, str]] = collections.defaultdict(dict)
         self.task_jobs: dict[str, str] = {}
+        self._pvc_name: str | None = None
 
     def _init_k8s(self):
         try:
@@ -85,28 +86,72 @@ class DirectRunner:
         return success
 
     def _ensure_volume(self) -> str | None:
+        if self._pvc_name:
+            return self._pvc_name
+
         vol = self.pipeline.volume
         if not vol.enabled:
             return None
 
+        # 1. If explicit PVC name is provided (and not temp), verify it exists
+        if vol.name and not vol.temp:
+            pvc_name = vol.name
+            try:
+                self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)
+                console.print(f"Using existing PVC: [bold]{pvc_name}[/bold]")
+                return pvc_name
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    try:
+                        pvcs = self.core_v1.list_namespaced_persistent_volume_claim(namespace=self.namespace)
+                        available = [p.metadata.name for p in pvcs.items]
+                    except Exception:
+                        available = []
+                    avail_str = f" Available PVCs in '{self.namespace}': {available}" if available else ""
+                    raise RuntimeError(
+                        f"PersistentVolumeClaim '{pvc_name}' does not exist in namespace '{self.namespace}'.{avail_str}\n"
+                        f"To auto-provision a clean temporary volume instead, use VolumeConfig(temp=True, storage_class='...')."
+                    ) from None
+                raise
+
+        # 2. Dynamic temporary or auto-created volume
         pvc_name = vol.name or (f"temp-{uuid.uuid4().hex[:8]}" if vol.temp else f"{self.pipeline.name}-pvc")
         
         try:
             self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)
             console.print(f"Using existing PVC: [bold]{pvc_name}[/bold]")
+            self._pvc_name = pvc_name
             return pvc_name
         except client.exceptions.ApiException as e:
             if e.status != 404:
                 raise
-            if not vol.create_if_missing:
+            if not vol.create_if_missing and not vol.temp:
                 raise RuntimeError(f"PVC '{pvc_name}' not found and create_if_missing is False.")
 
+        # Pre-flight check: Validate StorageClass exists in cluster if possible
+        if vol.storage_class:
+            try:
+                storage_v1 = client.StorageV1Api()
+                sc_list = storage_v1.list_storage_class()
+                valid_scs = [sc.metadata.name for sc in sc_list.items]
+                if valid_scs and vol.storage_class not in valid_scs:
+                    raise RuntimeError(
+                        f"StorageClass '{vol.storage_class}' is not available in the cluster.\n"
+                        f"Available StorageClasses: {valid_scs}\n"
+                        f"Please set VolumeConfig(storage_class='...') to a supported StorageClass (e.g. 'azurefile-csi')."
+                    )
+            except client.exceptions.ApiException as sc_err:
+                if sc_err.status not in (403, 404):
+                    raise
+
         console.print(f"Creating shared PVC '[bold]{pvc_name}[/bold]' ({vol.size}) in namespace '{self.namespace}'...")
+        pvc_labels = {"tkf/run": self.run_id}
+        pvc_labels.update(self.pipeline.labels)
         pvc = client.V1PersistentVolumeClaim(
             metadata=client.V1ObjectMeta(
                 name=pvc_name,
                 namespace=self.namespace,
-                labels={"tkf.dev/run": self.run_id},
+                labels=pvc_labels,
             ),
             spec=client.V1PersistentVolumeClaimSpec(
                 access_modes=["ReadWriteMany" if vol.storage_class != "local-path" else "ReadWriteOnce"],
@@ -118,6 +163,7 @@ class DirectRunner:
         )
         self.core_v1.create_namespaced_persistent_volume_claim(namespace=self.namespace, body=pvc)
         console.print(f"[green]PVC '{pvc_name}' created successfully.[/green]")
+        self._pvc_name = pvc_name
         return pvc_name
 
     async def _execute_dag(self, tasks_map: dict[str, Task], pvc_name: str | None, stream_logs: bool) -> bool:
@@ -257,18 +303,32 @@ class DirectRunner:
             termination_message_policy="File",
         )
 
+        job_labels = {
+            "tkf/run": self.run_id,
+            "tkf/task": task.name,
+        }
+        job_labels.update(self.pipeline.labels)
+        job_labels.update(task.labels)
+
+        pod_annotations = {}
+        if task.disable_istio:
+            pod_annotations["sidecar.istio.io/inject"] = "false"
+        pod_annotations.update(self.pipeline.annotations)
+        pod_annotations.update(task.annotations)
+
         job = client.V1Job(
             metadata=client.V1ObjectMeta(
                 name=job_name,
                 namespace=self.namespace,
-                labels={"tkf.dev/run": self.run_id, "tkf.dev/task": task.name},
+                labels=job_labels,
             ),
             spec=client.V1JobSpec(
                 backoff_limit=0,
                 ttl_seconds_after_finished=getattr(self.pipeline, "ttl_seconds_after_finished", 300),
                 template=client.V1PodTemplateSpec(
                     metadata=client.V1ObjectMeta(
-                        labels={"tkf.dev/run": self.run_id, "tkf.dev/task": task.name}
+                        labels=job_labels,
+                        annotations=pod_annotations if pod_annotations else None,
                     ),
                     spec=client.V1PodSpec(
                         restart_policy="Never",

@@ -56,3 +56,28 @@ def test_to_manifest():
     assert manifest["metadata"]["name"] == "manifest-test"
     assert len(manifest["spec"]["tasks"]) == 1
     assert manifest["spec"]["volume"]["size"] == "2Gi"
+
+
+def test_task_and_pipeline_labels_annotations():
+    t1 = Task(
+        name="task1",
+        command=["python", "main.py"],
+        labels={"team": "ml", "env": "prod"},
+        annotations={"custom.annotation/foo": "bar"},
+        disable_istio=True,
+    )
+    p = Pipeline(
+        "labeled-pipeline",
+        labels={"pipeline-label": "test"},
+        annotations={"pipeline-anno": "val"},
+        ttl_seconds_after_finished=600,
+    )
+    p.add_task(t1)
+
+    assert t1.labels == {"team": "ml", "env": "prod"}
+    assert t1.annotations == {"custom.annotation/foo": "bar"}
+    assert t1.disable_istio is True
+    assert p.labels == {"pipeline-label": "test"}
+    assert p.annotations == {"pipeline-anno": "val"}
+    assert p.ttl_seconds_after_finished == 600
+

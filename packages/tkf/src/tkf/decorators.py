@@ -160,6 +160,9 @@ class TaskCallable:
         docker_image: str = "python:3.12-slim",
         resources: ComputeResources | None = None,
         helpers: list[Callable] | None = None,
+        labels: dict[str, str] | None = None,
+        annotations: dict[str, str] | None = None,
+        disable_istio: bool = True,
     ):
         self.fn = fn
         self.name = name or fn.__name__.replace("_", "-")
@@ -167,6 +170,9 @@ class TaskCallable:
         self.docker_image = docker_image
         self.resources = resources or ComputeResources()
         self.helpers = helpers or []
+        self.labels = labels or {}
+        self.annotations = annotations or {}
+        self.disable_istio = disable_istio
         functools.update_wrapper(self, fn)
 
     def __call__(self, *args, **kwargs) -> Any:
@@ -370,6 +376,9 @@ class Model(Artifact):
             command=["python3", "-c", runner_script],
             args=task_args,
             resources=self.resources,
+            labels=self.labels,
+            annotations=self.annotations,
+            disable_istio=self.disable_istio,
         )
 
 
@@ -379,6 +388,9 @@ def task(
     docker_image: str = "python:3.12-slim",
     resources: ComputeResources | None = None,
     helpers: list[Callable] | None = None,
+    labels: dict[str, str] | None = None,
+    annotations: dict[str, str] | None = None,
+    disable_istio: bool = True,
 ) -> Callable[[Callable], TaskCallable]:
     """Decorator to convert a standard Python function into a dual-mode tkf Task."""
     def decorator(fn: Callable) -> TaskCallable:
@@ -389,5 +401,8 @@ def task(
             docker_image=docker_image,
             resources=resources,
             helpers=helpers,
+            labels=labels,
+            annotations=annotations,
+            disable_istio=disable_istio,
         )
     return decorator

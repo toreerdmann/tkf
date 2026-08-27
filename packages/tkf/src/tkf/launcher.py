@@ -26,11 +26,70 @@ def submit_launcher_job(
         k8s_config.load_kube_config()
 
     batch_v1 = client.BatchV1Api()
+    core_v1 = client.CoreV1Api()
     run_id = f"{pipeline.name}-{uuid.uuid4().hex[:6]}"
     launcher_job_name = f"launcher-{run_id}"
 
-    # Serialize pipeline manifest
+    # Volume Pre-Flight Validation & Provisioning
+    vol = pipeline.volume
+    pvc_name = None
+    if vol.enabled:
+        if vol.name and not vol.temp:
+            # 1. Verify named PVC exists
+            try:
+                core_v1.read_namespaced_persistent_volume_claim(name=vol.name, namespace=namespace)
+                pvc_name = vol.name
+                console.print(f"Using existing PVC: [bold]{pvc_name}[/bold]")
+            except client.exceptions.ApiException as e:
+                if e.status == 404:
+                    try:
+                        pvcs = [p.metadata.name for p in core_v1.list_namespaced_persistent_volume_claim(namespace=namespace).items]
+                    except Exception:
+                        pvcs = []
+                    avail_str = f" Available in '{namespace}': {pvcs}" if pvcs else ""
+                    raise RuntimeError(
+                        f"PersistentVolumeClaim '{vol.name}' does not exist in namespace '{namespace}'.{avail_str}\n"
+                        f"To auto-provision a clean temporary volume instead, use VolumeConfig(temp=True, storage_class='...')."
+                    ) from None
+                raise
+        else:
+            # 2. Dynamic temporary PVC creation
+            pvc_name = vol.name or f"temp-{uuid.uuid4().hex[:8]}"
+            if vol.storage_class:
+                try:
+                    storage_v1 = client.StorageV1Api()
+                    sc_list = storage_v1.list_storage_class()
+                    valid_scs = [sc.metadata.name for sc in sc_list.items]
+                    if valid_scs and vol.storage_class not in valid_scs:
+                        raise RuntimeError(
+                            f"StorageClass '{vol.storage_class}' is not available in the cluster.\n"
+                            f"Available StorageClasses: {valid_scs}\n"
+                            f"Please set VolumeConfig(storage_class='...') to a supported StorageClass (e.g. 'azurefile-csi')."
+                        )
+                except client.exceptions.ApiException as sc_err:
+                    if sc_err.status not in (403, 404):
+                        raise
+
+            pvc_labels = {"tkf/run": run_id, **pipeline.labels}
+            pvc = client.V1PersistentVolumeClaim(
+                metadata=client.V1ObjectMeta(
+                    name=pvc_name,
+                    namespace=namespace,
+                    labels=pvc_labels,
+                ),
+                spec=client.V1PersistentVolumeClaimSpec(
+                    access_modes=["ReadWriteMany" if vol.storage_class != "local-path" else "ReadWriteOnce"],
+                    storage_class_name=vol.storage_class,
+                    resources=client.V1VolumeResourceRequirements(requests={"storage": vol.size}),
+                ),
+            )
+            core_v1.create_namespaced_persistent_volume_claim(namespace=namespace, body=pvc)
+            console.print(f"Created temporary shared PVC: [bold green]{pvc_name}[/bold green]")
+
+    # Serialize pipeline manifest with exact resolved PVC name
     manifest = pipeline.to_manifest()
+    if pvc_name and "volume" in manifest.get("spec", {}):
+        manifest["spec"]["volume"]["name"] = pvc_name
     spec_json = json.dumps(manifest)
     spec_b64 = base64.b64encode(spec_json.encode("utf-8")).decode("utf-8")
 
@@ -49,7 +108,7 @@ tasks_spec = spec_data.get('spec', {{}}).get('tasks', [])
 namespace = '{namespace}'
 run_id = '{run_id}'
 mount_path = vol_spec.get('mountPath', '/workspace')
-pvc_name = vol_spec.get('name')
+pvc_name = '{pvc_name}' if '{pvc_name}' != 'None' else None
 
 print(f"=== Starting In-Cluster Pipeline: {{run_id}} ===")
 print(f"Namespace: {{namespace}} | PVC: {{pvc_name}}")
@@ -115,12 +174,15 @@ async def run_task(task):
         termination_message_path="/dev/termination-log", termination_message_policy="File",
     )
     job = client.V1Job(
-        metadata=client.V1ObjectMeta(name=job_name, namespace=namespace, labels={{"tkf.dev/run": run_id, "tkf.dev/task": tname}}),
+        metadata=client.V1ObjectMeta(name=job_name, namespace=namespace, labels={{"tkf/run": run_id, "tkf/task": tname}}),
         spec=client.V1JobSpec(
             backoff_limit=0,
             ttl_seconds_after_finished=300,
             template=client.V1PodTemplateSpec(
-                metadata=client.V1ObjectMeta(labels={{"tkf.dev/run": run_id, "tkf.dev/task": tname}}),
+                metadata=client.V1ObjectMeta(
+                    labels={{"tkf/run": run_id, "tkf/task": tname}},
+                    annotations={{"sidecar.istio.io/inject": "false"}},
+                ),
                 spec=client.V1PodSpec(restart_policy="Never", containers=[container], volumes=volumes, image_pull_secrets=secrets)
             )
         )
@@ -174,6 +236,13 @@ async def main():
             task_statuses[finished_name] = 'Succeeded' if success else 'Failed'
 
     all_success = all(s == 'Succeeded' for s in task_statuses.values())
+    if vol_spec.get('temp') and pvc_name:
+        print(f"Cleaning up temporary PVC '{{pvc_name}}'...")
+        try:
+            core_v1.delete_namespaced_persistent_volume_claim(name=pvc_name, namespace=namespace)
+        except Exception as e:
+            print(f"Warning: could not delete temp PVC: {{e}}")
+
     print(f"\\n=== Pipeline {{run_id}} Finished: {{'SUCCESS' if all_success else 'FAILED'}} ===")
     sys.exit(0 if all_success else 1)
 
@@ -193,13 +262,16 @@ asyncio.run(main())
         metadata=client.V1ObjectMeta(
             name=launcher_job_name,
             namespace=namespace,
-            labels={"tkf.dev/launcher": run_id},
+            labels={"tkf/launcher": run_id},
         ),
         spec=client.V1JobSpec(
             backoff_limit=0,
             ttl_seconds_after_finished=300,
             template=client.V1PodTemplateSpec(
-                metadata=client.V1ObjectMeta(labels={"tkf.dev/launcher": run_id}),
+                metadata=client.V1ObjectMeta(
+                    labels={"tkf/launcher": run_id},
+                    annotations={"sidecar.istio.io/inject": "false"},
+                ),
                 spec=client.V1PodSpec(
                     restart_policy="Never",
                     service_account_name=service_account or "default",

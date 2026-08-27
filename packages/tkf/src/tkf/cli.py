@@ -27,6 +27,20 @@ def init_k8s():
             raise typer.Exit(code=1)
 
 
+def get_default_namespace() -> str:
+    """Detect current namespace from env or active kubeconfig context."""
+    import os
+    if os.environ.get("TKF_NAMESPACE"):
+        return os.environ["TKF_NAMESPACE"]
+    try:
+        _, active_context = k8s_config.list_kube_config_contexts()
+        if active_context and active_context.get("context", {}).get("namespace"):
+            return active_context["context"]["namespace"]
+    except Exception:
+        pass
+    return "default"
+
+
 @app.command()
 def controller(
     namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Namespace to watch (all if not set)"),
@@ -42,19 +56,20 @@ def controller(
     )
 
 
-@app.command()
-def list(
-    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
+@app.command("list")
+def list_runs(
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
 ):
     """List PipelineRuns in the cluster."""
     init_k8s()
+    ns = namespace or get_default_namespace()
     custom_api = client.CustomObjectsApi()
     
     try:
         res = custom_api.list_namespaced_custom_object(
             group="tkf.dev",
             version="v1alpha1",
-            namespace=namespace,
+            namespace=ns,
             plural="pipelineruns",
         )
     except client.exceptions.ApiException as e:
@@ -63,10 +78,10 @@ def list(
 
     items = res.get("items", [])
     if not items:
-        console.print(f"[yellow]No PipelineRuns found in namespace '{namespace}'.[/yellow]")
+        console.print(f"[yellow]No PipelineRuns found in namespace '{ns}'.[/yellow]")
         return
 
-    table = Table(title=f"PipelineRuns ({namespace})")
+    table = Table(title=f"PipelineRuns ({ns})")
     table.add_column("Name", style="bold cyan")
     table.add_column("Phase", style="bold")
     table.add_column("Tasks (Done/Total)")
@@ -100,17 +115,18 @@ def list(
 @app.command()
 def status(
     name: str = typer.Argument(..., help="PipelineRun name"),
-    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
 ):
     """Show detailed status of a PipelineRun and its DAG tasks."""
     init_k8s()
+    ns = namespace or get_default_namespace()
     custom_api = client.CustomObjectsApi()
     
     try:
         obj = custom_api.get_namespaced_custom_object(
             group="tkf.dev",
             version="v1alpha1",
-            namespace=namespace,
+            namespace=ns,
             plural="pipelineruns",
             name=name,
         )
@@ -122,7 +138,7 @@ def status(
     status = obj.get("status", {})
     phase = status.get("phase", "Pending")
     
-    console.print(f"\n[bold]PipelineRun:[/bold] [cyan]{name}[/cyan] (Namespace: {namespace})")
+    console.print(f"\n[bold]PipelineRun:[/bold] [cyan]{name}[/cyan] (Namespace: {ns})")
     console.print(f"[bold]Phase:[/bold] {phase}")
     console.print(f"[bold]PVC:[/bold] {status.get('pvcName', 'None')}")
     console.print(f"[bold]Started:[/bold] {status.get('startTime', 'N/A')}")
@@ -160,45 +176,135 @@ def status(
     console.print(table)
 
 
+def complete_tasks(incomplete: str = "") -> list[str]:
+    """Auto-complete available task names and run IDs from the cluster."""
+    try:
+        init_k8s()
+        ns = get_default_namespace()
+        core_v1 = client.CoreV1Api()
+        pods = core_v1.list_namespaced_pod(namespace=ns, label_selector="tkf/run")
+        results = []
+        seen = set()
+        for p in pods.items:
+            tname = p.metadata.labels.get("tkf/task") if p.metadata.labels else None
+            rname = p.metadata.labels.get("tkf/run") if p.metadata.labels else None
+            if tname and tname not in seen and tname.startswith(incomplete):
+                seen.add(tname)
+                results.append(tname)
+            if rname and rname not in seen and rname.startswith(incomplete):
+                seen.add(rname)
+                results.append(rname)
+        return results
+    except Exception:
+        return []
+
+
 @app.command()
 def logs(
-    pipeline_name: str = typer.Argument(..., help="PipelineRun name"),
-    task_name: str = typer.Argument(..., help="Task name"),
-    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
+    target: str = typer.Argument(..., help="Task name, pod name, or PipelineRun ID", autocompletion=complete_tasks),
+    task_name: Optional[str] = typer.Argument(None, help="Optional specific task name (if target is PipelineRun ID)", autocompletion=complete_tasks),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
+    follow: bool = typer.Option(False, "--follow", "-f", help="Follow / stream live log output"),
 ):
-    """View container logs for a specific task job."""
+    """View container logs for a specific task job or pipeline run."""
     init_k8s()
+    ns = namespace or get_default_namespace()
     core_v1 = client.CoreV1Api()
     
-    label_selector = f"tkf.dev/pipeline={pipeline_name},tkf.dev/task={task_name}"
-    pods = core_v1.list_namespaced_pod(namespace=namespace, label_selector=label_selector)
+    # 1. Determine search criteria
+    if task_name:
+        pipeline_name, t_name = target, task_name
+        label_selector = f"tkf/task={t_name}"
+    else:
+        pipeline_name, t_name = None, target
+        label_selector = f"tkf/task={target}"
+
+    pods = core_v1.list_namespaced_pod(namespace=ns, label_selector=label_selector)
+    if not pods.items and not task_name:
+        # Fallback: search by run ID
+        pods = core_v1.list_namespaced_pod(namespace=ns, label_selector=f"tkf/run={target}")
+
+    if pipeline_name and pods.items:
+        pods.items = [
+            p for p in pods.items
+            if p.metadata.labels and (
+                p.metadata.labels.get("tkf/run") == pipeline_name
+                or p.metadata.labels.get("tkf/pipeline") == pipeline_name
+                or p.metadata.labels.get("tkf.dev/pipeline") == pipeline_name
+                or p.metadata.labels.get("tkf.dev/run") == pipeline_name
+            )
+        ]
     
     if not pods.items:
-        console.print(f"[yellow]No pods found for task '{task_name}' in pipeline '{pipeline_name}'.[/yellow]")
+        import difflib
+        console.print(f"[yellow]No active pods found matching '{target}' in namespace '{ns}'.[/yellow]\n")
+        
+        # Fetch all available tasks & runs to provide smart suggestions
+        try:
+            all_pods = core_v1.list_namespaced_pod(namespace=ns, label_selector="tkf/run")
+            available_tasks = {
+                p.metadata.labels.get("tkf/task"): p.metadata.labels.get("tkf/run")
+                for p in all_pods.items if p.metadata.labels and p.metadata.labels.get("tkf/task")
+            }
+            available_runs = {
+                p.metadata.labels.get("tkf/run")
+                for p in all_pods.items if p.metadata.labels and p.metadata.labels.get("tkf/run")
+            }
+            
+            candidates = list(available_tasks.keys()) + list(available_runs)
+            matches = difflib.get_close_matches(target, [c for c in candidates if c], n=3, cutoff=0.3)
+            if matches:
+                console.print("[bold cyan]Did you mean:[/bold cyan]")
+                for m in matches:
+                    console.print(f"  * [green]{m}[/green]")
+                console.print()
+
+            if all_pods.items:
+                table = Table(title=f"Available Pipeline Tasks in '{ns}'")
+                table.add_column("Task Name", style="bold green")
+                table.add_column("Pipeline Run", style="cyan")
+                table.add_column("Status")
+                for p in all_pods.items:
+                    t = p.metadata.labels.get("tkf/task", "-") if p.metadata.labels else "-"
+                    r = p.metadata.labels.get("tkf/run", "-") if p.metadata.labels else "-"
+                    st = p.status.phase
+                    table.add_row(t, r, st)
+                console.print(table)
+        except Exception:
+            pass
         return
 
-    pod_name = pods.items[0].metadata.name
-    console.print(f"[bold cyan]--- Logs for {task_name} (Pod: {pod_name}) ---[/bold cyan]\n")
-    try:
-        log_content = core_v1.read_namespaced_pod_log(name=pod_name, namespace=namespace, container=task_name)
-        console.print(log_content)
-    except client.exceptions.ApiException as e:
-        console.print(f"[red]Error fetching logs: {e}[/red]")
+    for pod in pods.items:
+        pod_name = pod.metadata.name
+        task_label = pod.metadata.labels.get("tkf/task", pod.spec.containers[0].name) if pod.metadata.labels else pod.spec.containers[0].name
+        console.print(f"[bold cyan]--- Logs for {task_label} (Pod: {pod_name}, Namespace: {ns}) ---[/bold cyan]\n")
+        try:
+            if follow:
+                from kubernetes import watch
+                w = watch.Watch()
+                for line in w.stream(core_v1.read_namespaced_pod_log, name=pod_name, namespace=ns, container=task_label):
+                    print(line)
+            else:
+                log_content = core_v1.read_namespaced_pod_log(name=pod_name, namespace=ns, container=task_label)
+                console.print(log_content)
+        except client.exceptions.ApiException as e:
+            console.print(f"[red]Error fetching logs: {e}[/red]")
 
 
 @app.command()
 def delete(
     name: str = typer.Argument(..., help="PipelineRun name"),
-    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
 ):
     """Delete a PipelineRun and its associated resources."""
     init_k8s()
+    ns = namespace or get_default_namespace()
     custom_api = client.CustomObjectsApi()
     try:
         custom_api.delete_namespaced_custom_object(
             group="tkf.dev",
             version="v1alpha1",
-            namespace=namespace,
+            namespace=ns,
             plural="pipelineruns",
             name=name,
         )
@@ -216,36 +322,54 @@ if __name__ == "__main__":
 
 @app.command()
 def clean(
-    namespace: str = typer.Option("tkf-dev", "--namespace", "-n", help="Kubernetes namespace"),
-    all_jobs: bool = typer.Option(True, "--all", help="Delete all completed/failed jobs and pods"),
-    pvcs: bool = typer.Option(False, "--pvcs", help="Also delete PVCs in the namespace"),
+    run_id: Optional[str] = typer.Option(None, "--run", "-r", help="Clean only resources for a specific run ID", autocompletion=complete_tasks),
+    namespace: Optional[str] = typer.Option(None, "--namespace", "-n", help="Kubernetes namespace"),
+    all_jobs: bool = typer.Option(True, "--all", help="Delete all completed/failed tkf jobs and pods"),
+    pvcs: bool = typer.Option(False, "--pvcs", help="Also delete temporary tkf PVCs labeled with tkf/run"),
 ):
-    """Clean up all completed, failed, or leftover jobs, pods, and PVCs in the namespace."""
+    """Safely clean up completed, failed, or leftover tkf jobs, pods, and temporary PVCs."""
     init_k8s()
+    ns = namespace or get_default_namespace()
     batch_v1 = client.BatchV1Api()
     core_v1 = client.CoreV1Api()
     
-    console.print(f"[yellow]Cleaning up Jobs and Pods in namespace '{namespace}'...[/yellow]")
+    label_selector = f"tkf/run={run_id}" if run_id else "tkf/run"
+    console.print(f"[yellow]Cleaning up tkf resources in namespace '{ns}' (selector: {label_selector})...[/yellow]")
     
-    # 1. Delete Jobs
-    jobs = batch_v1.list_namespaced_job(namespace=namespace)
+    # 1. Delete tkf Jobs (and their pods)
+    jobs = batch_v1.list_namespaced_job(namespace=ns, label_selector=label_selector)
+    # Also include launcher jobs if no specific run filter or matching launcher
+    if not run_id:
+        launcher_jobs = batch_v1.list_namespaced_job(namespace=ns, label_selector="tkf/launcher")
+        jobs.items.extend(launcher_jobs.items)
+
+    deleted_jobs = 0
     for j in jobs.items:
         jname = j.metadata.name
         try:
             batch_v1.delete_namespaced_job(name=jname, namespace=namespace, propagation_policy="Foreground")
             console.print(f"  - Deleted Job: [dim]{jname}[/dim]")
+            deleted_jobs += 1
         except Exception:
             pass
 
-    # 2. Optionally Delete PVCs
+    if deleted_jobs == 0:
+        console.print("  [dim]No tkf jobs found to clean.[/dim]")
+
+    # 2. Optionally Delete only tkf temporary PVCs
     if pvcs:
-        pvc_list = core_v1.list_namespaced_persistent_volume_claim(namespace=namespace)
+        pvc_list = core_v1.list_namespaced_persistent_volume_claim(namespace=namespace, label_selector=label_selector)
+        deleted_pvcs = 0
         for p in pvc_list.items:
             pname = p.metadata.name
             try:
                 core_v1.delete_namespaced_persistent_volume_claim(name=pname, namespace=namespace)
-                console.print(f"  - Deleted PVC: [red]{pname}[/red]")
+                console.print(f"  - Deleted tkf PVC: [red]{pname}[/red]")
+                deleted_pvcs += 1
             except Exception:
                 pass
+        if deleted_pvcs == 0:
+            console.print("  [dim]No tkf PVCs found to clean.[/dim]")
 
-    console.print(f"[green]✔ Namespace '{namespace}' cleaned up successfully![/green]")
+    console.print(f"[green]✔ tkf cleanup in namespace '{namespace}' complete![/green]")
+
