@@ -42,7 +42,9 @@ class VolumeConfig:
     enabled: bool = True
 
     def to_spec(self, fallback_name: str) -> VolumeSpec:
-        vol_name = self.name or (f"{fallback_name}-pvc" if not self.temp else f"temp-{uuid.uuid4().hex[:8]}")
+        if self.name is None and self.temp:
+            self.name = f"temp-{uuid.uuid4().hex[:8]}"
+        vol_name = self.name or f"{fallback_name}-pvc"
         return VolumeSpec(
             enabled=self.enabled,
             name=vol_name,

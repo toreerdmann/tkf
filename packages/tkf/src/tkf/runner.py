@@ -115,7 +115,10 @@ class DirectRunner:
                 raise
 
         # 2. Dynamic temporary or auto-created volume
-        pvc_name = vol.name or (f"temp-{uuid.uuid4().hex[:8]}" if vol.temp else f"{self.pipeline.name}-pvc")
+        if not vol.name and vol.temp:
+            vol.name = f"temp-{uuid.uuid4().hex[:8]}"
+        pvc_name = vol.name or f"{self.pipeline.name}-pvc"
+        vol.name = pvc_name
         
         try:
             self.core_v1.read_namespaced_persistent_volume_claim(name=pvc_name, namespace=self.namespace)

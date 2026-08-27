@@ -54,7 +54,10 @@ def submit_launcher_job(
                 raise
         else:
             # 2. Dynamic temporary PVC creation
-            pvc_name = vol.name or f"temp-{uuid.uuid4().hex[:8]}"
+            if not vol.name and vol.temp:
+                vol.name = f"temp-{uuid.uuid4().hex[:8]}"
+            pvc_name = vol.name or f"{pipeline.name}-pvc"
+            vol.name = pvc_name
             if vol.storage_class:
                 try:
                     storage_v1 = client.StorageV1Api()
